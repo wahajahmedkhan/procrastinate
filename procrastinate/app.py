@@ -4,22 +4,33 @@ import asyncio
 import contextlib
 import functools
 import logging
-from collections.abc import Iterable, Iterator
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    TypedDict,
-)
+from collections.abc import Awaitable, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, TypeAlias, TypedDict
 
 from typing_extensions import NotRequired, Unpack
 
-from procrastinate import blueprints, exceptions, jobs, manager, schema, utils
+from procrastinate import (
+    blueprints,
+    exceptions,
+    job_context,
+    jobs,
+    manager,
+    schema,
+    tasks,
+    utils,
+)
 from procrastinate import connector as connector_module
 
 if TYPE_CHECKING:
     from procrastinate import worker
 
 logger = logging.getLogger(__name__)
+
+ProcessTask: TypeAlias = Callable[[tasks.Task, job_context.JobContext], Awaitable[Any]]
+Middleware: TypeAlias = Callable[
+    [ProcessTask],
+    Callable[[tasks.Task, job_context.JobContext], Awaitable[Any]],
+]
 
 
 class WorkerOptions(TypedDict):
@@ -34,6 +45,7 @@ class WorkerOptions(TypedDict):
     delete_jobs: NotRequired[str | jobs.DeleteJobCondition]
     additional_context: NotRequired[dict[str, Any]]
     install_signal_handlers: NotRequired[bool]
+    middleware: NotRequired[Middleware]
 
 
 class App(blueprints.Blueprint):

@@ -30,6 +30,13 @@ FETCH_JOB_POLLING_INTERVAL = 5.0  # seconds
 ABORT_JOB_POLLING_INTERVAL = 5.0  # seconds
 
 
+def default_middleware(process_task: app.ProcessTask):
+    async def middleware(task: tasks.Task, context: job_context.JobContext):
+        return await process_task(task, context)
+
+    return middleware
+
+
 class Worker:
     def __init__(
         self,
@@ -45,6 +52,7 @@ class Worker:
         delete_jobs: str | jobs.DeleteJobCondition | None = None,
         additional_context: dict[str, Any] | None = None,
         install_signal_handlers: bool = True,
+        middleware: app.Middleware = default_middleware,
     ):
         self.app = app
         self.queues = queues
@@ -61,6 +69,7 @@ class Worker:
         ) or jobs.DeleteJobCondition.NEVER
         self.additional_context = additional_context
         self.install_signal_handlers = install_signal_handlers
+        self.middleware = middleware
 
         if self.worker_name:
             self.logger = logger.getChild(self.worker_name)
@@ -197,6 +206,33 @@ class Worker:
         log_level = logging.ERROR if status == jobs.Status.FAILED else logging.INFO
         logger.log(log_level, text, extra=extra, exc_info=exc_info)
 
+    async def _process_task(self, task: tasks.Task, context: job_context.JobContext):
+        job = context.job
+
+        async def ensure_async() -> Callable[..., Awaitable]:
+            await_func: Callable[..., Awaitable]
+            if inspect.iscoroutinefunction(task.func):
+                await_func = task
+            else:
+                await_func = functools.partial(utils.sync_to_async, task)
+
+            job_args = [context] if task.pass_context else []
+            task_result = await await_func(*job_args, **job.task_kwargs)
+            # In some cases, the task function might be a synchronous function
+            # that returns an awaitable without actually being a
+            # coroutinefunction. In that case, in the await above, we haven't
+            # actually called the task, but merely generated the awaitable that
+            # implements the task. In that case, we want to wait this awaitable.
+            # It's easy enough to be in that situation that the best course of
+            # action is probably to await the awaitable.
+            # It's not even sure it's worth emitting a warning
+            if inspect.isawaitable(task_result):
+                task_result = await task_result
+
+            return task_result
+
+        return await ensure_async()
+
     async def _process_job(self, context: job_context.JobContext):
         """
         Processes a given job and persists its status
@@ -229,29 +265,8 @@ class Worker:
 
             exc_info: bool | BaseException = False
 
-            async def ensure_async() -> Callable[..., Awaitable]:
-                await_func: Callable[..., Awaitable]
-                if inspect.iscoroutinefunction(task.func):
-                    await_func = task
-                else:
-                    await_func = functools.partial(utils.sync_to_async, task)
-
-                job_args = [context] if task.pass_context else []
-                task_result = await await_func(*job_args, **job.task_kwargs)
-                # In some cases, the task function might be a synchronous function
-                # that returns an awaitable without actually being a
-                # coroutinefunction. In that case, in the await above, we haven't
-                # actually called the task, but merely generated the awaitable that
-                # implements the task. In that case, we want to wait this awaitable.
-                # It's easy enough to be in that situation that the best course of
-                # action is probably to await the awaitable.
-                # It's not even sure it's worth emitting a warning
-                if inspect.isawaitable(task_result):
-                    task_result = await task_result
-
-                return task_result
-
-            job_result.result = await ensure_async()
+            middleware = self.middleware(self._process_task)
+            job_result.result = await middleware(task, context)
 
         except BaseException as e:
             exc_info = e
